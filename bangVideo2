@@ -1,0 +1,175 @@
+function bangVideo(nwb, filePath)
+% bangVideo  Render full‐session 640×480 @25 fps MP4 with:
+%   • Top: eye‐trace (or TTL pulses), fixed 1280×1024 bounds
+%   • Bottom: 5 s sliding‐window spike raster over all 46 units
+%   • Harvard‐style click sound for each spike
+%
+% USAGE:
+%   nwb = nwbRead(filePath);
+%   bangVideo(nwb, filePath);
+
+    %% 1) Spike times extraction
+    flatT = nwb.units.spike_times.data.load();
+    idx0  = nwb.units.spike_times_index.data.load();
+    idx   = double(idx0) + 1;
+    nU    = numel(idx);
+    fprintf('Detected %d units\n', nU);
+    spikeTimes = cell(nU,1);
+    for u = 1:nU
+        sI = idx(u);
+        if u < nU
+            eI = idx(u+1) - 1;
+        else
+            eI = numel(flatT);
+        end
+        spikeTimes{u} = flatT(sI:eI);
+    end
+
+    %% 2) Brain regions for color‐coding
+    elecIDs = double( h5read(filePath, '/general/extracellular_ephys/electrodes/id') );
+    locs    =       h5read(filePath, '/general/extracellular_ephys/electrodes/location');
+    unitEID = double( h5read(filePath, '/units/electrode_id') );
+    id2loc  = containers.Map(num2cell(elecIDs), locs(:));
+    regs    = repmat({'unknown'}, nU,1);
+    for u = 1:nU
+        if id2loc.isKey(unitEID(u))
+            regs{u} = id2loc(unitEID(u));
+        end
+    end
+    uniqR = unique(regs,'stable');
+    cmap  = lines(numel(uniqR));
+    mapR  = containers.Map(uniqR, num2cell(cmap,2));
+
+    %% 3) Eye tracking (or TTL fallback)
+    hasEye = false;
+    ttlTS  = [];  % predefine
+    try
+        D   = h5read(filePath, '/processing/behavior/EyeTracking/SpatialSeries/data');
+        t0  = h5read(filePath, '/processing/behavior/EyeTracking/SpatialSeries/starting_time');
+        rate= h5readatt(filePath,'/processing/behavior/EyeTracking/SpatialSeries/starting_time','rate');
+        nP  = size(D,2);
+        eyeTS = t0 + (0:nP-1)'/rate;
+        eyeX  = D(1,:);
+        eyeY  = D(2,:);
+        hasEye  = true;
+        screenW = 1280; screenH = 1024;
+    catch
+        aq = nwb.acquisition;
+        if any(strcmp(aq.keys','events_ttl'))
+            ttl   = aq.get('events_ttl');
+            ttlTS = ttl.timestamps.data.load();
+        else
+            error('No EyeTracking or events_ttl found.');
+        end
+    end
+
+    %% 4) Compute tmax
+    tMaxSpike = 0;
+    for u = 1:nU
+        st = spikeTimes{u};
+        if ~isempty(st)
+            tMaxSpike = max(tMaxSpike, max(st));
+        end
+    end
+    if hasEye
+        tRef = eyeTS(end);
+    else
+        tRef = ttlTS(end);
+    end
+    tmax = min(tMaxSpike, tRef);
+    assert(tmax>0,'No data to render.');
+
+    %% 5) Build click waveform (column vector)
+    fsA    = 44100;
+    tClick = 0:1/fsA:0.003;
+    clickW = (hann(numel(tClick)).*sin(2*pi*1500*tClick))';
+    clickW = clickW(:);
+
+    %% 6) Setup VideoWriter
+    fps     = 25;
+    outName = 'bangVideo.mp4';
+    vw      = VideoWriter(outName,'MPEG-4');
+    vw.FrameRate = fps;
+    open(vw);
+
+    %% 7) Create figure & axes
+    fig   = figure('Color','w','Position',[100 100 640 480], 'MenuBar','none','ToolBar','none');
+    axTop = axes('Parent',fig,'Position',[0.05 0.55 0.90 0.40]); hold(axTop,'on');
+    if hasEye
+        axis(axTop,'off');
+        set(axTop,'XLim',[0 screenW],'YLim',[0 screenH],'YDir','reverse');
+        title(axTop,'Eye Trace');
+    else
+        axis(axTop,'on'); xlabel(axTop,'Time (s)'); ylabel(axTop,'TTL');
+        title(axTop,'TTL Pulses');
+    end
+    axBot = axes('Parent',fig,'Position',[0.05 0.05 0.90 0.40]); hold(axBot,'on');
+    axBot.YDir = 'reverse';
+    xlabel(axBot,'Time (s)'); ylabel(axBot,'Unit #');
+    title(axBot,'Spike Raster (5 s window)');
+
+    %% 8) Render loop
+    win     = 5;     % s window
+    tailDur = 0.5;   % s tail
+    nFrames = ceil(tmax*fps);
+
+    for f = 1:nFrames
+        t    = (f-1)/fps;
+        t0r  = max(0, t-win/2);
+        t1r  = t0r + win;
+
+        % Top panel
+        cla(axTop);
+        if hasEye
+            sel   = eyeTS>=t-tailDur & eyeTS<=t;
+            ages  = t - eyeTS(sel);
+            alps  = max(0,1 - ages/tailDur);
+            for k=1:numel(ages)
+                scatter(axTop, eyeX(sel(k)), eyeY(sel(k)), 20, 'r','filled','MarkerFaceAlpha',alps(k));
+            end
+            [~,ic] = min(abs(eyeTS - t));
+            scatter(axTop, eyeX(ic), eyeY(ic),50,'r','filled');
+        else
+            sel = ttlTS>=t0r & ttlTS<=t1r;
+            if any(sel)
+                plot(axTop, ttlTS(sel), ones(nnz(sel),1),'|k','MarkerSize',10);
+            end
+            xlim(axTop,[t0r t1r]); ylim(axTop,[0 2]);
+        end
+
+        % Bottom panel: grid
+        cla(axBot);
+        for u=1:nU
+            plot(axBot, [t0r t1r],[u u],':','Color',[0.7 0.7 0.7]);
+        end
+
+        % Spikes + clicks
+        Nbuf     = round((1/fps)*fsA);
+        audioBuf = zeros(Nbuf,1);
+        for u = 1:nU
+            st = spikeTimes{u};
+            in = st>=t0r & st<t1r;
+            if any(in)
+                times = st(in);
+                scatter(axBot, times, u*ones(size(times)), 10, mapR(regs{u}), 'filled');
+                for s = times'
+                    samp0 = round((s-t0r)*fsA) + 1;
+                    if samp0 <= Nbuf
+                        eI  = min(samp0+numel(clickW)-1, Nbuf);
+                        len = eI - samp0 + 1;
+                        audioBuf(samp0:eI) = audioBuf(samp0:eI) + clickW(1:len);
+                    end
+                end
+            end
+        end
+        xlim(axBot,[t0r t1r]); ylim(axBot,[0 nU+1]);
+
+        drawnow;
+        sound(audioBuf, fsA);
+        writeVideo(vw, getframe(fig));
+    end
+
+    close(vw);
+    close(fig);
+    fprintf('Saved %s (%d frames, up to %.1f s)\n', outName, nFrames, tmax);
+end
